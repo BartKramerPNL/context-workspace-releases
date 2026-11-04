@@ -1,0 +1,543 @@
+# Builds Context Workspace from the private source repository, tests the installers and the update path on every
+# platform, and publishes the release. Started by hand (see docs/release.md in the source repository):
+#   gh workflow run release.yml -R BartKramerPNL/context-workspace-releases -f ref=v1.2.3
+#   gh workflow run release.yml -R BartKramerPNL/context-workspace-releases -f ref=main -f test_only=true
+name: Release
+run-name: Release ${{ inputs.ref }}${{ inputs.test_only && ' (test only)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source ref to build; a version tag (vX.Y.Z), or any branch, tag or commit when test_only is set
+        required: true
+        type: string
+      test_only:
+        description: Build and test only; create no release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency: release-${{ inputs.ref }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  resolve:
+    name: Resolve the version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      tag: ${{ steps.source.outputs.tag }}
+      commit: ${{ steps.source.outputs.commit }}
+      has_prev: ${{ steps.prev.outputs.has_prev }}
+      prev_tag: ${{ steps.prev.outputs.prev_tag }}
+      n_version: ${{ steps.prev.outputs.n_version }}
+      mac_silent_updates: ${{ steps.flag.outputs.mac_silent_updates }}
+    steps:
+      - name: Validate the inputs
+        env:
+          REF: ${{ inputs.ref }}
+          TEST_ONLY: ${{ inputs.test_only }}
+        run: |
+          if [ "$TEST_ONLY" = true ]; then
+            pattern='^[A-Za-z0-9._/-]+$'
+          else
+            pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          fi
+          if ! [[ $REF =~ $pattern ]]; then
+            echo "::error::ref must match $pattern"
+            exit 1
+          fi
+
+      - name: Check out package.json and app-identity.ts
+        uses: actions/checkout@v7
+        with:
+          repository: BartKramerPNL/workspace-tool
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: |
+            /package.json
+            /src/shared/app-identity.ts
+          sparse-checkout-cone-mode: false
+
+      - name: Read the version and commit
+        id: source
+        env:
+          REF: ${{ inputs.ref }}
+          TEST_ONLY: ${{ inputs.test_only }}
+        run: |
+          version=$(jq -r .version src/package.json)
+          if ! [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the package.json version must be X.Y.Z"
+            exit 1
+          fi
+          if [ "$TEST_ONLY" != true ] && [ "$REF" != "v$version" ]; then
+            echo "::error::the tag $REF does not match the package.json version $version"
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "commit=$(git -C src rev-parse HEAD)"
+          } >>"$GITHUB_OUTPUT"
+
+      # MAC_SILENT_UPDATES of this build. The macOS update test accepts exit code 12 (macOS rejected the signature of
+      # the update) only when it is false: that is the release that switches silent updates off, tested against a
+      # version N that still has them on (see "macOS without silent updates" in docs/release.md). A declaration in
+      # another form fails the job, so a renamed or rewritten constant is noticed here.
+      - name: Read the macOS silent-updates flag
+        id: flag
+        run: |
+          file=src/src/shared/app-identity.ts
+          declaration='^export const MAC_SILENT_UPDATES: boolean = (true|false);$'
+          if [ "$(grep -cE "$declaration" "$file" || true)" != 1 ]; then
+            echo "::error::$file must declare MAC_SILENT_UPDATES once as: export const MAC_SILENT_UPDATES: boolean = true;"
+            exit 1
+          fi
+          flag=$(sed -nE "s/$declaration/\1/p" "$file")
+          echo "MAC_SILENT_UPDATES is $flag"
+          echo "mac_silent_updates=$flag" >>"$GITHUB_OUTPUT"
+
+      # Version N in the update test is the last published release; before the first release (or when this run
+      # rebuilds that release's version) it is a second build of this source, versioned X.Y.Z-updatetest.0.
+      - name: Find the last published release
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.source.outputs.tag }}
+          VERSION: ${{ steps.source.outputs.version }}
+          TEST_ONLY: ${{ inputs.test_only }}
+        run: |
+          if prev_tag=$(gh release view --json tagName -q .tagName -R "$GITHUB_REPOSITORY" 2>"$RUNNER_TEMP/gh.err"); then
+            if ! [[ $prev_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::the latest release has an unexpected tag"
+              exit 1
+            fi
+          elif grep -q 'release not found' "$RUNNER_TEMP/gh.err"; then
+            prev_tag=
+          else
+            cat "$RUNNER_TEMP/gh.err" >&2
+            exit 1
+          fi
+          if [ "$TEST_ONLY" != true ] &&
+            gh release view "$TAG" --json isDraft -q .isDraft -R "$GITHUB_REPOSITORY" 2>/dev/null | grep -qx false; then
+            echo "::error::$TAG is already published"
+            exit 1
+          fi
+          if [ -n "$prev_tag" ] && [ "$prev_tag" != "$TAG" ]; then
+            printf 'has_prev=true\nprev_tag=%s\nn_version=%s\n' "$prev_tag" "${prev_tag#v}" >>"$GITHUB_OUTPUT"
+          else
+            printf 'has_prev=false\nprev_tag=\nn_version=%s\n' "$VERSION-updatetest.0" >>"$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.platform }} ${{ matrix.arch }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, platform: mac, arch: arm64 }
+          - { os: macos-15-intel, platform: mac, arch: x64 }
+          - { os: windows-latest, platform: win, arch: x64 }
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      ARCH: ${{ matrix.arch }}
+      HAS_PREV: ${{ needs.resolve.outputs.has_prev }}
+      N_VERSION: ${{ needs.resolve.outputs.n_version }}
+    steps:
+      # The commit `ref` resolved to, so every job builds the same source.
+      - name: Check out the source
+        uses: actions/checkout@v7
+        with:
+          repository: BartKramerPNL/workspace-tool
+          ref: ${{ needs.resolve.outputs.commit }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: src
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - name: Install dependencies
+        working-directory: src
+        run: |
+          npm ci
+          npm run setup:electron
+          npm run setup:git
+
+      # build/after-pack.cjs signs the app with this identity. The certificate is self-signed and untrusted, which
+      # codesign accepts when it is given the identity's SHA-1, so no trust settings are needed.
+      - name: Import the signing certificate
+        if: matrix.platform == 'mac'
+        env:
+          P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          PW: ${{ secrets.MAC_CERT_P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/cw-signing.keychain-db"
+          KCPW=$(openssl rand -hex 24)
+          echo "::add-mask::$KCPW"
+          printf '%s' "$P12_BASE64" | base64 --decode >"$RUNNER_TEMP/cw.p12"
+          security create-keychain -p "$KCPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KCPW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cw.p12" -k "$KEYCHAIN" -f pkcs12 -P "$PW" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cw.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPW" "$KEYCHAIN" >/dev/null
+          existing=()
+          while IFS= read -r line; do
+            line=${line#*\"}
+            existing+=("${line%\"*}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$KEYCHAIN" "${existing[@]}"
+          identity=$(security find-certificate -c 'app.contextworkspace.desktop signing' -Z "$KEYCHAIN" |
+            awk '/^SHA-1 hash:/ { print $3 }')
+          if ! [[ $identity =~ ^[0-9A-F]{40}$ ]]; then
+            echo "::error::no 'app.contextworkspace.desktop signing' certificate in MAC_CERT_P12_BASE64"
+            exit 1
+          fi
+          echo "CW_MAC_KEYCHAIN=$KEYCHAIN" >>"$GITHUB_ENV"
+          echo "CW_MAC_SIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
+
+      - name: Build
+        working-directory: src
+        run: |
+          if [ "$PLATFORM" = mac ]; then
+            targets=(--mac dmg zip "--$ARCH")
+          else
+            targets=(--win nsis --x64)
+          fi
+          npx electron-vite build
+          npx electron-builder "${targets[@]}" --publish never
+          if [ "$HAS_PREV" != true ]; then
+            echo "Building version N ($N_VERSION) for the update test"
+            npx electron-builder "${targets[@]}" --publish never \
+              -c.extraMetadata.version="$N_VERSION" -c.directories.output=dist-prev
+          fi
+
+      # An ad-hoc signature passes the first check alone; the other two prove the app carries the long-lived
+      # certificate and app ID that macOS ties updates and permissions to.
+      - name: Check the signatures
+        if: matrix.platform == 'mac'
+        working-directory: src
+        run: |
+          shopt -s nullglob
+          apps=(dist/mac*/*.app dist-prev/mac*/*.app)
+          if [ "${#apps[@]}" -eq 0 ]; then
+            echo "::error::no app bundles in dist"
+            exit 1
+          fi
+          for app in "${apps[@]}"; do
+            echo "Checking $app"
+            codesign --verify --deep --strict --verbose=2 "$app"
+            codesign -dvv "$app" 2>&1 | grep -F 'Authority=app.contextworkspace.desktop signing'
+            codesign -d -r- "$app" 2>&1 | grep -F 'identifier "app.contextworkspace.desktop"'
+          done
+
+      - name: Upload the installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: installers-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            src/dist/*-mac-*.dmg
+            src/dist/*-mac-*.zip
+            src/dist/*-mac-*.blockmap
+            src/dist/*-win-*-setup.exe
+            src/dist/*-win-*-setup.exe.blockmap
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload the feed file
+        uses: actions/upload-artifact@v7
+        with:
+          name: feed-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            src/dist/latest-mac.yml
+            src/dist/latest.yml
+          if-no-files-found: error
+
+      - name: Upload version N
+        if: needs.resolve.outputs.has_prev != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: prev-installers-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            src/dist-prev/*-mac-*.dmg
+            src/dist-prev/*-win-*-setup.exe
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Delete the signing keychain
+        if: always() && matrix.platform == 'mac'
+        run: |
+          rm -f "$RUNNER_TEMP/cw.p12"
+          security delete-keychain "$RUNNER_TEMP/cw-signing.keychain-db" 2>/dev/null || true
+
+  merge-feed:
+    name: Merge the macOS feed files
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the feed files
+        uses: actions/download-artifact@v8
+        with:
+          pattern: feed-mac-*
+          path: feeds
+
+      - name: Test the merge script
+        run: bash .github/scripts/merge-latest-mac.test.sh
+
+      - name: Merge
+        run: bash .github/scripts/merge-latest-mac.sh feeds/feed-mac-arm64/latest-mac.yml feeds/feed-mac-x64/latest-mac.yml latest-mac.yml
+
+      - name: Upload the merged feed file
+        uses: actions/upload-artifact@v7
+        with:
+          name: latest-mac
+          path: latest-mac.yml
+          if-no-files-found: error
+
+  install-test:
+    name: Install test (${{ matrix.platform }} ${{ matrix.arch }})
+    needs: [resolve, build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, platform: mac, arch: arm64 }
+          - { os: macos-15-intel, platform: mac, arch: x64 }
+          - { os: windows-latest, platform: win, arch: x64 }
+    env:
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the installers
+        uses: actions/download-artifact@v8
+        with:
+          name: installers-${{ matrix.platform }}-${{ matrix.arch }}
+          path: installers
+
+      - name: Install test (macOS)
+        if: matrix.platform == 'mac'
+        run: bash .github/scripts/install-test-mac.sh "installers/context-workspace-$VERSION-mac-$ARCH.dmg" "$VERSION" reports/self-check.json
+
+      - name: Install test (Windows)
+        if: matrix.platform == 'win'
+        shell: pwsh
+        run: ./.github/scripts/install-test-win.ps1 -Installer "installers/context-workspace-$env:VERSION-win-x64-setup.exe" -Version $env:VERSION -Report reports/self-check.json
+
+      - name: Upload the self-check report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: install-test-${{ matrix.platform }}-${{ matrix.arch }}
+          path: reports
+          if-no-files-found: ignore
+
+  update-test:
+    name: Update test (${{ matrix.platform }} ${{ matrix.arch }})
+    needs: [resolve, build, merge-feed]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, platform: mac, arch: arm64 }
+          - { os: macos-15-intel, platform: mac, arch: x64 }
+          - { os: windows-latest, platform: win, arch: x64 }
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      N_VERSION: ${{ needs.resolve.outputs.n_version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download version N+1
+        uses: actions/download-artifact@v8
+        with:
+          name: installers-${{ matrix.platform }}-${{ matrix.arch }}
+          path: feed
+
+      - name: Download the merged macOS feed file
+        if: matrix.platform == 'mac'
+        uses: actions/download-artifact@v8
+        with:
+          name: latest-mac
+          path: feed
+
+      - name: Download the Windows feed file
+        if: matrix.platform == 'win'
+        uses: actions/download-artifact@v8
+        with:
+          name: feed-win-x64
+          path: feed
+
+      - name: Download version N from the last release
+        if: needs.resolve.outputs.has_prev == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
+        run: |
+          if [ "$PLATFORM" = mac ]; then
+            pattern="context-workspace-*-mac-$ARCH.dmg"
+          else
+            pattern="context-workspace-*-win-$ARCH-setup.exe"
+          fi
+          gh release download "$PREV_TAG" -p "$pattern" -D n -R "$GITHUB_REPOSITORY"
+
+      - name: Download version N from this run
+        if: needs.resolve.outputs.has_prev != 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: prev-installers-${{ matrix.platform }}-${{ matrix.arch }}
+          path: n
+
+      - name: Test the macOS test helpers
+        if: matrix.platform == 'mac'
+        run: bash .github/scripts/lib-mac.test.sh
+
+      - name: Update test (macOS)
+        if: matrix.platform == 'mac'
+        env:
+          NEXT_MAC_SILENT_UPDATES: ${{ needs.resolve.outputs.mac_silent_updates }}
+        run: bash .github/scripts/update-test-mac.sh "n/context-workspace-$N_VERSION-mac-$ARCH.dmg" "$N_VERSION" feed "$VERSION" reports
+
+      - name: Update test (Windows)
+        if: matrix.platform == 'win'
+        shell: pwsh
+        run: ./.github/scripts/update-test-win.ps1 -FromInstaller "n/context-workspace-$env:N_VERSION-win-x64-setup.exe" -FromVersion $env:N_VERSION -Feed feed -ToVersion $env:VERSION -OutDir reports
+
+      - name: Upload the reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: update-test-${{ matrix.platform }}-${{ matrix.arch }}
+          path: reports
+          if-no-files-found: ignore
+
+      - name: Upload the ShipIt logs
+        if: failure() && matrix.platform == 'mac'
+        uses: actions/upload-artifact@v7
+        with:
+          name: shipit-logs-${{ matrix.arch }}
+          path: |
+            ~/Library/Caches/app.contextworkspace.desktop.ShipIt/ShipIt_stderr.log
+            ~/Library/Caches/app.contextworkspace.desktop.ShipIt/ShipIt_stdout.log
+          if-no-files-found: ignore
+
+  # Runs next to the tests: when a test fails, the release stays a draft and is never published.
+  release-draft:
+    name: Draft the release
+    needs: [resolve, build, merge-feed]
+    if: ${{ !inputs.test_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      # The bundled Git is GPLv2, so every release carries its source. These follow the dugite-native release that
+      # the pinned dugite package bundles; update them together with dugite.
+      DUGITE_NATIVE_TAG: v2.56.0-2
+      GIT_VERSION: 2.56.0
+      GIT_FOR_WINDOWS_TAG: v2.56.0.windows.4
+    steps:
+      - name: Download the installers
+        uses: actions/download-artifact@v8
+        with:
+          pattern: installers-*
+          path: assets
+          merge-multiple: true
+
+      - name: Download the merged macOS feed file
+        uses: actions/download-artifact@v8
+        with:
+          name: latest-mac
+          path: assets
+
+      - name: Download the Windows feed file
+        uses: actions/download-artifact@v8
+        with:
+          name: feed-win-x64
+          path: assets
+
+      - name: Download the Git source archives
+        working-directory: assets
+        run: |
+          curl -fsSL --retry 3 -o "dugite-native-${DUGITE_NATIVE_TAG#v}-source.tar.gz" \
+            "https://github.com/desktop/dugite-native/archive/refs/tags/$DUGITE_NATIVE_TAG.tar.gz"
+          curl -fsSL --retry 3 -o "git-$GIT_VERSION.tar.xz" \
+            "https://www.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz"
+          curl -fsSL --retry 3 -o "git-for-windows-${GIT_FOR_WINDOWS_TAG#v}-source.tar.gz" \
+            "https://github.com/git-for-windows/git/archive/refs/tags/$GIT_FOR_WINDOWS_TAG.tar.gz"
+
+      - name: Write SHA256SUMS.txt
+        run: (cd assets && sha256sum -- * > SHA256SUMS.txt)
+
+      - name: Attest the assets
+        uses: actions/attest@v4
+        with:
+          subject-path: assets/*
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          while gh release view "$TAG" --json isDraft -q .isDraft -R "$GITHUB_REPOSITORY" 2>/dev/null | grep -qx true; do
+            echo "Deleting the earlier draft of $TAG"
+            gh release delete "$TAG" --yes -R "$GITHUB_REPOSITORY"
+          done
+          cat >notes.md <<EOF
+          Built from source commit \`$COMMIT\` by [this workflow run]($RUN_URL).
+
+          Which file to download, the first-launch steps and how to verify the downloads are in the
+          [README](https://github.com/$GITHUB_REPOSITORY#readme).
+          EOF
+          gh release create "$TAG" assets/* --draft -t "$TAG" -F notes.md -R "$GITHUB_REPOSITORY"
+
+  publish:
+    name: Publish the release
+    needs: [resolve, build, install-test, update-test, release-draft]
+    if: ${{ !inputs.test_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false --latest -R "$GITHUB_REPOSITORY"
